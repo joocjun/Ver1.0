@@ -1,72 +1,69 @@
 # https://www.tensorflow.org/tutorials/text/transformer
 
-import tensorflow
-from tensorflow import keras
-import random,os,sys
-import numpy as np
-from keras.models import *
-from keras.layers import *
-from keras.callbacks import *
-from keras.initializers import *
+import tensorflow as tf
 
-class EncoderLayer(tf.keras.layers.Layer):
-  def __init__(self, d_model, num_heads, dff, rate=0.1):
-    super(EncoderLayer, self).__init__()
+class MultiHeadAttention(tf.keras.Model):
+    def __init__(self, hidden_size, head, masked=False):
+        super(MultiHeadAttention, self).__init__()
 
-    self.mha = MultiHeadAttention(d_model, num_heads)
-    self.ffn = point_wise_feed_forward_network(d_model, dff)
+        self.hidden_size = hidden_size
+        self.head = head  # head의 수
 
-    self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-    self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.wq = tf.keras.layers.Dense(hidden_size, use_bias=False)
+        self.wk = tf.keras.layers.Dense(hidden_size, use_bias=False)
+        self.wv = tf.keras.layers.Dense(hidden_size, use_bias=False)
 
-    self.dropout1 = tf.keras.layers.Dropout(rate)
-    self.dropout2 = tf.keras.layers.Dropout(rate)
+        self.linear = tf.keras.layers.Dense(hidden_size, use_bias=False)
 
-  def call(self, x, training, mask):
+        self.scale = tf.keras.layers.Lambda(lambda x: x / np.sqrt(hidden_size))
+        self.masked = masked
 
-    attn_output, _ = self.mha(x, x, x, mask)  # (batch_size, input_seq_len, d_model)
-    attn_output = self.dropout1(attn_output, training=training)
-    out1 = self.layernorm1(x + attn_output)  # (batch_size, input_seq_len, d_model)
+    def call(self, q, k, v, mask=None):
 
-    ffn_output = self.ffn(out1)  # (batch_size, input_seq_len, d_model)
-    ffn_output = self.dropout2(ffn_output, training=training)
-    out2 = self.layernorm2(out1 + ffn_output)  # (batch_size, input_seq_len, d_model)
+        assert q.shape[-1] % self.head == 0
 
-    return out2
+        wq = tf.reshape(self.wq(q), [self.head, q.shape[0], q.shape[1], -1])
+        wk = tf.reshape(self.wk(k), [self.head, k.shape[0], k.shape[1], -1])
+        wv = tf.reshape(self.wv(v), [self.head, v.shape[0], v.shape[1], -1])
+        # (head_n,bs,ts,hs/head_n)
+        scaled_attention_logit = self.scale(tf.matmul(wq, wk, transpose_b=True))
 
-class Encoder(tf.keras.layers.Layer):
-  def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size,
-               maximum_position_encoding, rate=0.1):
-    super(Encoder, self).__init__()
+        if self.masked:
+            mask = (1 - tf.linalg.band_part(tf.ones(scaled_attention_logit.shape[1:]), -1, 0)) * -1e9
+            scaled_attention_logit = tf.reshape([head + mask for head in scaled_attention_logit],
+                                                 scaled_attention_logit.shape)
 
-    self.d_model = d_model
-    self.num_layers = num_layers
+        attention_weight = tf.nn.softmax(scaled_attention_logit, axis=-1)
+        # head_n,bs,ts,hs/head_n
+        output = tf.reshape(tf.matmul(attention_weight, wv), q.shape)
+        output = self.linear(output)
+        # (bs,ts,hs)
 
-    self.embedding = tf.keras.layers.Embedding(input_vocab_size, d_model)
-    self.pos_encoding = positional_encoding(maximum_position_encoding, 
-                                            self.d_model)
+        return attention_weight, output
 
 
-    self.enc_layers = [EncoderLayer(d_model, num_heads, dff, rate) 
-                       for _ in range(num_layers)]
+class EncoderBlock(tf.keras.Model):
+    def __init__(self, hidden_size, head_num, dropout, layer_norm_epsilon):
+        super(EncoderBlock, self).__init__()
 
-    self.dropout = tf.keras.layers.Dropout(rate)
+        self.MultiHeadAttention = MultiHeadAttention(hidden_size, head_num)
+        self.MHA_Dropout = tf.keras.layers.Dropout(dropout)
+        self.MHA_Normalization = tf.keras.layers.LayerNormalization(epsilon=layer_norm_epsilon)
 
-  def call(self, x, training, mask):
+        self.FFN = tf.keras.Sequential([
+            tf.keras.layers.Dense(hidden_size * 4),
+            tf.keras.layers.LeakyReLU(),
+            tf.keras.layers.Dense(hidden_size)])
 
-    seq_len = tf.shape(x)[1]
+        self.FFN_Dropout = tf.keras.layers.Dropout(dropout)
+        self.FFN_Normalization = tf.keras.layers.LayerNormalization(epsilon=layer_norm_epsilon)
 
-    # adding embedding and position encoding.
-    x = self.embedding(x)  # (batch_size, input_seq_len, d_model)
-    x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-    x += self.pos_encoding[:, :seq_len, :]
+    def call(self, x):
+        normalized_x = self.MHA_Normalization(x)
+        attention_weight, attention_output = self.MultiHeadAttention(normalized_x, normalized_x, normalized_x)
+        attention_output = x + self.MHA_Dropout(attention_output)
 
-    x = self.dropout(x, training=training)
+        normalized_attention_output = self.FFN_Normalization(attention_output)
+        FFN_output = attention_output + self.FFN_Dropout(self.FFN(normalized_attention_output))
 
-    for i in range(self.num_layers):
-      x = self.enc_layers[i](x, training, mask)
-
-    return x  # (batch_size, input_seq_len, d_model)
-
-
-config = get_config()
+        return attention_weight, FFN_output
